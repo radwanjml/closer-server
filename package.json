@@ -1,0 +1,15 @@
+{
+  "name": "closer-server",
+  "version": "0.1.0",
+  "description": "WebSocket relay for Closer - a two-player world across HYD and DXB",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
