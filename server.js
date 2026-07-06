@@ -35,13 +35,13 @@ function broadcast(msg, exceptId = null) {
 
 wss.on('connection', (ws) => {
   const id = String(nextId++);
-  players.set(id, { ws, role: null, name: null, d: null });
+  players.set(id, { ws, color: null, name: null, d: null });
   ws.isAlive = true;
 
   // Tell the newcomer who they are and who is already here
   const roster = [];
   for (const [pid, p] of players) {
-    if (pid !== id && p.role) roster.push({ id: pid, role: p.role, name: p.name, d: p.d });
+    if (pid !== id && p.color) roster.push({ id: pid, color: p.color, name: p.name, d: p.d });
   }
   send(ws, { t: 'welcome', id, players: roster });
 
@@ -55,9 +55,9 @@ wss.on('connection', (ws) => {
 
     switch (msg.t) {
       case 'join':
-        me.role = msg.role === 'rose' ? 'rose' : 'gold';
-        me.name = String(msg.name || '').slice(0, 20) || (me.role === 'rose' ? 'Neethi' : 'Red');
-        broadcast({ t: 'joined', id, role: me.role, name: me.name }, id);
+        me.color = /^#[0-9a-fA-F]{6}$/.test(msg.color || '') ? msg.color : '#e8b84b';
+        me.name = String(msg.name || '').slice(0, 20) || 'Someone';
+        broadcast({ t: 'joined', id, color: me.color, name: me.name }, id);
         break;
 
       case 'state': // { d: {x,y,z,ry,mv,sit} } ~12 times/sec
