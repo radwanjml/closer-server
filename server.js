@@ -129,6 +129,11 @@ function rollFuelType() {
 }
 
 const embers = new Map();   // room -> campfire state
+const ROOM_CAP = 2;
+
+function normRoom(r) {
+  return String(r || '').toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 32);
+}
 
 function roomPopulation(room) {
   let n = 0;
@@ -198,7 +203,7 @@ function spawnStick(em, now) {
     // build a byte-identical stick on every device — which is the whole
     // reason driftwood can be described instead of shipped
     seed: 1 + Math.floor(Math.random() * 0xfffffff),
-    by: null, byName: null, heldUntil: null,
+    by: null, byName: null, byCid: null, heldUntil: null,
   };
   em.sticks.push(s);
   return s;
@@ -261,12 +266,13 @@ function adoptClaims(room, oldId, newId) {
    for real in testing (claims survived the disconnect, then failed to come
    back). Sticks therefore carry the claimant's NAME as well as their id —
    the name is the only thing the two sockets share. */
-function adoptClaimsByName(room, nameLower, newId) {
+function adoptClaimsBySeat(room, cid, nameLower, newId) {
   const em = embers.get(room);
   if (!em) return false;
   let changed = false;
   for (const x of em.sticks) {
-    if (x.heldUntil !== null && x.byName && x.byName.toLowerCase() === nameLower) {
+    const mine = cid ? x.byCid === cid : (!x.byCid && x.byName && x.byName.toLowerCase() === nameLower);
+    if (x.heldUntil !== null && mine) {
       x.by = newId; x.heldUntil = null; changed = true;
     }
   }
@@ -275,6 +281,20 @@ function adoptClaimsByName(room, nameLower, newId) {
 
 // --- plain HTTP endpoint so hosting health checks pass -------
 const server = http.createServer((req, res) => {
+  /* GET /room?r=<name> — who is already standing in a room, so the doorway
+     can say "your Kompanion is waiting" before anyone commits. Only what the
+     arriving player would see the moment they joined anyway: first name and
+     character, never ids or state. */
+  if (req.url && req.url.startsWith('/room')) {
+    const r = normRoom(new URL(req.url, 'http://x').searchParams.get('r'));
+    const who = [];
+    if (r) for (const [, p] of players) {
+      if (p.room === r && p.color && p.ws.readyState === p.ws.OPEN) who.push({ name: p.name, char: p.char });
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify({ room: r, n: who.length, full: who.length >= ROOM_CAP, who: who.slice(0, ROOM_CAP) }));
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end('Closer server awake · HYD ✦ 2,430 km ✦ DXB\n');
 });
@@ -321,7 +341,14 @@ wss.on('connection', (ws) => {
         me.color = /^#[0-9a-fA-F]{6}$/.test(msg.color || '') ? msg.color : '#e8b84b';
         me.name = String(msg.name || '').slice(0, 20) || 'Someone';
         me.char = String(msg.char || '').slice(0, 20) || 'pip';
-        me.room = String(msg.room || '').slice(0, 40) || 'default';
+        // rooms are typed by people now ("Amber Tide" and "amber-tide" are one
+        // room); the client normalises the same way, this is the backstop
+        me.room = normRoom(msg.room) || 'default';
+        // per-tab identity (sessionStorage on the client). A reconnect is the
+        // same TAB coming back, not the same NAME: two people may both be
+        // called Red, and two tabs of one browser always share a name. Old
+        // clients send no cid and keep the old name-based behaviour.
+        me.cid = typeof msg.cid === 'string' && /^[a-z0-9]{8,32}$/.test(msg.cid) ? msg.cid : null;
 
         // reconnect, not a third party: the room is always exactly two named
         // people, so if the same name rejoins the same room while their old
@@ -331,9 +358,10 @@ wss.on('connection', (ws) => {
         // stale one until the heartbeat catches up (~5-10s). Evict the old
         // socket immediately instead of waiting on the heartbeat backstop.
         const myNameLower = me.name.toLowerCase();
+        const sameSeat = (p) => me.cid ? p.cid === me.cid
+                                       : (!p.cid && p.name && p.name.toLowerCase() === myNameLower);
         for (const [pid, p] of players) {
-          if (pid !== id && p.room === me.room && p.color && p.ws.readyState === p.ws.OPEN &&
-              p.name && p.name.toLowerCase() === myNameLower) {
+          if (pid !== id && p.room === me.room && p.color && p.ws.readyState === p.ws.OPEN && sameSeat(p)) {
             broadcast({ t: 'left', id: pid }, pid, p.room);
             // driftwood follows the seat: adopt this name's claims onto the
             // new socket before the old one is dropped, or an armful of
@@ -342,6 +370,16 @@ wss.on('connection', (ws) => {
             p.ws.terminate();
             players.delete(pid);
           }
+        }
+
+        // the cove is for two. A third arrival (a common room name, a third
+        // tab) is told so and closed, instead of silently joining and
+        // stealing partnerId() from whichever client sees it first.
+        if (roomPopulation(me.room) - 1 >= ROOM_CAP) {
+          send(ws, { t: 'full', room: me.room });
+          me.room = null;
+          ws.close(4001, 'room full');
+          break;
         }
 
         // session continuity, extending the reconnect logic above rather
@@ -358,9 +396,7 @@ wss.on('connection', (ws) => {
         const roomSessions = sessions.get(me.room);
         if (roomSessions) {
           for (const [, s] of roomSessions) {
-            const held = s.participants.find(
-              (p) => p.id !== id && p.name && p.name.toLowerCase() === myNameLower
-            );
+            const held = s.participants.find((p) => p.id !== id && sameSeat(p));
             if (held) {
               held.id = id;
               held.connected = true;
@@ -372,7 +408,7 @@ wss.on('connection', (ws) => {
         // driftwood comes back with the seat, on the same terms and for the
         // same reason — a refresh is not a departure, and it should not tip
         // your armful onto the sand
-        adoptClaimsByName(me.room, myNameLower, id);
+        adoptClaimsBySeat(me.room, me.cid, myNameLower, id);
 
         // roster is only knowable once we know which room to scope it to —
         // welcome waits for 'join' rather than firing on raw connection.
@@ -454,7 +490,7 @@ wss.on('connection', (ws) => {
           roomSessions.set(activityId, s);
         }
         if (!s.participants.some((p) => p.id === id)) {
-          s.participants.push({ id, name: me.name, connected: true, heldUntil: null });
+          s.participants.push({ id, name: me.name, cid: me.cid, connected: true, heldUntil: null });
         }
         broadcastSession(me.room, s);
         break;
@@ -514,12 +550,13 @@ wss.on('connection', (ws) => {
         const x = em.sticks.find((k) => k.id === msg.id);
         // already claimed — possibly by the asker, whose grant went missing.
         // Silence is right either way: the next snapshot tells them the truth.
-        if (!x || x.by !== null) break;
+        if (!x || x.by !== null) { send(ws, embersPayload(em, me.room)); break; }
         let held = 0;
         for (const k of em.sticks) if (k.by === id) held++;
         if (held >= EMBERS_RING_CAP) break;
         x.by = id;
-        x.byName = me.name;   // the only handle a reconnect can be matched on
+        x.byName = me.name;   // the handle an old (cid-less) reconnect is matched on
+        x.byCid = me.cid;     // the handle a current one is matched on
         x.heldUntil = null;
         // don't respawn onto the patch of sand someone just cleared
         em.cooldowns.set(x.spi, Date.now() + EMBERS_SPAWN_COOLDOWN_MS);
@@ -536,9 +573,15 @@ wss.on('connection', (ws) => {
         const now = Date.now();
         const present = roomPopulation(me.room);
         const i = em.sticks.findIndex((k) => k.id === msg.id && k.by === id);
-        if (i === -1) break;                    // not yours, or already burnt
+        // a refused feed still answers the feeder: their client took the
+        // stick out of the ring optimistically, and without a reply it stays
+        // missing until the next 3s resync drops it back in — which reads as
+        // "the fire ate it, then it came back"
+        if (i === -1) { send(ws, embersPayload(em, me.room)); break; }   // not yours, or already burnt
         settleFuel(em, now, present);
-        if (em.fuel >= 0.995) break;            // full: the stick stays in hand
+        // a full fire still takes the stick (fuel stays capped below). It used
+        // to refuse, and since a new room's fire starts full, that refusal was
+        // most people's first attempt at feeding it.
         const x = em.sticks[i];
         em.sticks.splice(i, 1);
         em.fuel = Math.min(1, em.fuel + EMBERS_FEED_PER_LOG);
